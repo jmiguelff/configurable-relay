@@ -30,10 +30,23 @@
 
 #include <Arduino.h>
 #include <EEPROM.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
 // ------ I/O for relay --------
 static constexpr uint8_t RELAY_PIN = 7;
 static constexpr bool RELAY_ACTIVE_HIGH = true;
+
+// ------  LCD GLOBALS ------ 
+static constexpr uint8_t LCD_ADDR = 0x27;
+static constexpr uint8_t LCD_COLS = 16;
+static constexpr uint8_t LCD_ROWS = 2;
+
+// Start LCD object
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
+
+static constexpr uint32_t LCD_UPDATE_MS = 500;
+static uint32_t lastLcdUpdateMs = 0;
 
 static inline void relayWrite(bool on)
 {
@@ -43,6 +56,23 @@ static inline void relayWrite(bool on)
     digitalWrite(RELAY_PIN, on ? LOW : HIGH);
   }
 }
+
+// Helper to print a value as 3 digits (clamped) to keep the LCD stable
+static void print3(uint32_t v)
+{
+  if (v > 999) v = 999;
+  if (v < 100) lcd.print('0');
+  if (v < 10)  lcd.print('0');
+  lcd.print(v);
+}
+
+// ------  ENCODER GLOBALS ------ 
+static constexpr uint8_t ENC_PIN_A  = 2;  // CLK
+static constexpr uint8_t ENC_PIN_B  = 3;  // DT
+static constexpr uint8_t ENC_PIN_SW = 4;  // SW (button)
+
+// Emit one UI "click" per detent (typically 4 transitions)
+static constexpr int8_t kStepsPerDetent = 4;
 
 // ------ EEPROM logic --------
 namespace RelayConfig {
@@ -237,15 +267,282 @@ private:
   uint32_t last_ms_{0};
 };
 
+// ------ Encoder class -----
+class Ky040 {
+public:
+  void begin()
+  {
+    pinMode(ENC_PIN_A, INPUT_PULLUP);
+    pinMode(ENC_PIN_B, INPUT_PULLUP);
+    pinMode(ENC_PIN_SW, INPUT_PULLUP);
+
+    lastAB_ = readAB();
+    lastSw_ = digitalRead(ENC_PIN_SW);
+    lastSwChangeMs_ = millis();
+    swPressedMs_ = 0;
+    clickPending_ = false;
+    longPressPending_ = false;
+  }
+
+  // Call frequently from loop()
+  void update()
+  {
+    updateRotation();
+    updateButton();
+  }
+
+  // Rotation delta since last call (-N..+N). Consumes the delta.
+  int8_t consumeDelta()
+  {
+    int8_t d = delta_;
+    delta_ = 0;
+    return d;
+  }
+
+  // Button events (edge-based). Consume on read.
+  bool consumeClick()
+  {
+    bool v = clickPending_;
+    clickPending_ = false;
+    return v;
+  }
+
+  bool consumeLongPress()
+  {
+    bool v = longPressPending_;
+    longPressPending_ = false;
+    return v;
+  }
+
+private:
+  // --- Rotation (simple state table) ---
+  uint8_t readAB() const
+  {
+    // A is MSB, B is LSB
+    const uint8_t a = digitalRead(ENC_PIN_A) ? 1 : 0;
+    const uint8_t b = digitalRead(ENC_PIN_B) ? 1 : 0;
+    return (a << 1) | b;
+  }
+
+  void updateRotation()
+  {
+    const uint8_t ab = readAB();
+    if (ab == lastAB_) return;
+
+    // Gray-code transition table:
+    // index = (lastAB_ << 2) | ab
+    static constexpr int8_t kTable[16] = {
+      0, -1, +1,  0,
+      +1, 0,  0, -1,
+      -1, 0,  0, +1,
+      0, +1, -1,  0
+    };
+
+    const uint8_t idx = (lastAB_ << 2) | ab;
+    const int8_t step = kTable[idx];
+    lastAB_ = ab;
+
+    detentAcc_ += step;
+
+    if (detentAcc_ >= kStepsPerDetent) {
+      delta_ += 1;
+      detentAcc_ = 0;
+    } else if (detentAcc_ <= -kStepsPerDetent) {
+      delta_ -= 1;
+      detentAcc_ = 0;
+    }
+  }
+
+  // --- Button (debounced) ---
+  void updateButton()
+  {
+    const uint32_t now = millis();
+    const uint8_t sw = digitalRead(ENC_PIN_SW); // pull-up: LOW = pressed
+
+    if (sw != lastSw_) {
+      // debounce
+      if (now - lastSwChangeMs_ >= kDebounceMs) {
+        lastSw_ = sw;
+        lastSwChangeMs_ = now;
+
+        if (sw == LOW) {
+          // pressed
+          swPressedMs_ = now;
+          longPressFired_ = false;
+        } else {
+          // released
+          if (swPressedMs_ != 0 && !longPressFired_) {
+            clickPending_ = true;
+          }
+          swPressedMs_ = 0;
+        }
+      }
+    }
+
+    // long press detection
+    if (lastSw_ == LOW && swPressedMs_ != 0 && !longPressFired_) {
+      if (now - swPressedMs_ >= kLongPressMs) {
+        longPressPending_ = true;
+        longPressFired_ = true;
+      }
+    }
+  }
+
+private:
+  static constexpr uint32_t kDebounceMs  = 25;
+  static constexpr uint32_t kLongPressMs = 1200;
+
+  uint8_t lastAB_{0};
+  int8_t  delta_{0};
+  int8_t detentAcc_{0};
+
+  uint8_t lastSw_{HIGH};
+  uint32_t lastSwChangeMs_{0};
+  uint32_t swPressedMs_{0};
+  bool longPressFired_{false};
+
+  bool clickPending_{false};
+  bool longPressPending_{false};
+};
+
 // ------ Global instances --------
 RelayConfig::Store gCfg;
 RelayLogic gRelayLogic;
+
+enum class UiField : uint8_t { Ton, Toff };
+static UiField uiField = UiField::Ton;
+static bool uiEditing = false;
+
+Ky040 enc;
+static uint32_t pendingTonS = 0;
+static uint32_t pendingToffS = 0;
 
 static void updateAndRestart()
 {
   gRelayLogic.stop();
   gRelayLogic.setTimers(gCfg.getTonS(), gCfg.getToffS());
   gRelayLogic.start();
+}
+
+// ------ LCD update logic ------
+static void updateLcd()
+{
+  const uint32_t now = millis();
+  if (now - lastLcdUpdateMs < LCD_UPDATE_MS)
+    return;
+
+  lastLcdUpdateMs = now;
+
+  // -------- Line 1: RUN/STOP + state + remaining --------
+  lcd.setCursor(0, 0);
+
+  lcd.print(uiEditing ? "*" : " "); // editing indicator
+
+  // RUN/STOP + optional edit marker
+  if (gRelayLogic.isRunning()) {
+    lcd.print("RUN ");
+  } else {
+    lcd.print("STOP");
+  }
+
+  // Relay state (ON/OFF/--)
+  lcd.print(" S:");
+  switch (gRelayLogic.state()) {
+    case RelayLogic::State::On:   
+      lcd.print("ON "); 
+      break;
+    
+    case RelayLogic::State::Off:  
+      lcd.print("OFF"); 
+      break;
+
+    default:                      
+      lcd.print("-- "); 
+      break;
+  }
+
+  // Remaining time (xyzs)
+  lcd.print(" ");
+  uint32_t rem = gRelayLogic.remainingTimeS();
+  if (rem > 999) rem = 999;
+
+  if (rem < 100) lcd.print('0');
+  if (rem < 10)  lcd.print('0');
+  lcd.print(rem);
+  lcd.print('s');
+
+  // Ensure rest of line is blank (avoid leftover chars)
+  lcd.print(" ");
+
+  // -------- Line 2: editable Ton/Toff with selection marker --------
+  lcd.setCursor(0, 1);
+
+  // Render using pending values (what user is editing), not committed EEPROM values
+  // Format: ">ON:080 OFF:160" or " ON:080>OFF:160"
+  if (uiField == UiField::Ton) 
+    lcd.print('>');
+  else                         
+    lcd.print(' ');
+
+  lcd.print("ON:");
+  print3(pendingTonS); // helper below
+
+  lcd.print(' ');
+
+  if (uiField == UiField::Toff) 
+    lcd.print('>');
+  else                          
+    lcd.print(' ');
+
+  lcd.print("OF:");
+  print3(pendingToffS);
+
+  // Pad out remainder to avoid leftover characters from previous renders
+  lcd.print("    ");
+}
+
+// ------ Encoder logic  ------
+static void handleEncoder()
+{
+  enc.update();
+
+  // Rotation
+  int8_t d = enc.consumeDelta();
+  if (d != 0) {
+    // If it feels too fast, divide by 4 using an accumulator.
+    if (!uiEditing) {
+      // Change selection
+      if (d > 0) uiField = (uiField == UiField::Ton) ? UiField::Toff : UiField::Ton;
+      if (d < 0) uiField = (uiField == UiField::Ton) ? UiField::Toff : UiField::Ton;
+    } else {
+      // Edit selected field
+      auto clamp = [](int32_t v) -> uint32_t {
+        if (v < 1) return 1;
+        if (v > 3600) return 3600;
+        return static_cast<uint32_t>(v);
+      };
+
+      if (uiField == UiField::Ton) {
+        pendingTonS = clamp(static_cast<int32_t>(pendingTonS) + d);
+      } else {
+        pendingToffS = clamp(static_cast<int32_t>(pendingToffS) + d);
+      }
+    }
+  }
+
+  // Click: toggle editing
+  if (enc.consumeClick()) {
+    uiEditing = !uiEditing;
+  }
+
+  // Long press: save + apply
+  if (enc.consumeLongPress()) {
+    if (gCfg.setTonS(pendingTonS) && gCfg.setToffS(pendingToffS)) {
+      gCfg.save();
+      updateAndRestart();
+    }
+    uiEditing = !uiEditing;
+  }
 }
 
 // ------ Arduino standard functions --------
@@ -257,6 +554,20 @@ void setup()
   const unsigned long t0 = millis();
   while (!Serial && (millis() - t0 < 2000)) { }
 
+  // Start LCD configurations
+  Wire.begin();
+  lcd.init();
+  lcd.backlight();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Configurable");
+  lcd.setCursor(0, 1);
+  lcd.print("Relay");
+  delay(1000);
+  lcd.clear();
+
+  // Pin out configuration for relay
   pinMode(RELAY_PIN, OUTPUT);
   relayWrite(false);
 
@@ -267,6 +578,12 @@ void setup()
   gRelayLogic.begin(gCfg.getTonS(), gCfg.getToffS());
   gRelayLogic.start();
 
+  // Initialize encoder class
+  pendingTonS = gCfg.getTonS();
+  pendingToffS = gCfg.getToffS();
+
+  enc.begin();
+
   Serial.println(F("Configurable Relay Started"));
   Serial.print(F("Ton(s): "));  Serial.println(gCfg.getTonS());
   Serial.print(F("Toff(s): ")); Serial.println(gCfg.getToffS());
@@ -275,6 +592,8 @@ void setup()
 void loop()
 {
   gRelayLogic.update();
+  updateLcd();
+  handleEncoder();
 
   // Serial commands are just for testing before LCD/encoder UI:
   // start | stop | show | ton <s> | toff <s>
