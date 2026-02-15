@@ -26,7 +26,14 @@
  * Status:
  *   Core logic implemented and tested via Serial interface.
  *   UI (LCD + encoder) to be added in a future iteration.
+ *
+ * Serial Debug Mode:
+ *   To enable serial debugging and testing commands, uncomment the line below.
+ *   NOTE: Serial debugging uses String class which can cause heap fragmentation
+ *   on limited RAM devices. Disable for production use to ensure stability.
  */
+
+// #define SERIAL_DEBUG  // Uncomment to enable serial debug menu
 
 #include <Arduino.h>
 #include <EEPROM.h>
@@ -548,11 +555,13 @@ static void handleEncoder()
 // ------ Arduino standard functions --------
 void setup()
 {
+#ifdef SERIAL_DEBUG
   Serial.begin(9600);
 
   // Wait for serial (max 2s). Useful during dev; doesn't block forever in the field.
   const unsigned long t0 = millis();
   while (!Serial && (millis() - t0 < 2000)) { }
+#endif
 
   // Start LCD configurations
   Wire.begin();
@@ -584,9 +593,11 @@ void setup()
 
   enc.begin();
 
+#ifdef SERIAL_DEBUG
   Serial.println(F("Configurable Relay Started"));
   Serial.print(F("Ton(s): "));  Serial.println(gCfg.getTonS());
   Serial.print(F("Toff(s): ")); Serial.println(gCfg.getToffS());
+#endif
 }
 
 void loop()
@@ -595,6 +606,7 @@ void loop()
   updateLcd();
   handleEncoder();
 
+#ifdef SERIAL_DEBUG
   // Serial commands are just for testing before LCD/encoder UI:
   // start | stop | show | ton <s> | toff <s>
   if (Serial.available()) {
@@ -650,4 +662,5 @@ void loop()
       Serial.println(F("Commands: start | stop | show | ton <s> | toff <s>"));
     }
   }
+#endif
 }
