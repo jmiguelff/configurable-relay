@@ -36,6 +36,12 @@ The project is implemented as a clean, minimal embedded system using modern C++ 
 * **Relay control:** External relay or contactor (logic‑level controlled)
 * **Power:** Depends on relay/contactor and control PSU used
 
+### Arduino Nano Every pin mapping
+
+* **LCD I²C:** A4 (SDA), A5 (SCL)
+* **Relay signal:** D7 (contactor control voltage signal)
+* **Rotary encoder (KY‑040):** D2 (CLK), D3 (DT), D4 (SW)
+
 > ⚠️ **Important – Mains Safety**
 > This firmware only implements control logic.
 >
