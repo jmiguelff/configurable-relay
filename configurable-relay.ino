@@ -55,6 +55,10 @@ LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 static constexpr uint32_t LCD_UPDATE_MS = 500;
 static uint32_t lastLcdUpdateMs = 0;
 
+// Re-initialize the LCD periodically to recover from I2C bus glitches
+static constexpr uint32_t LCD_REINIT_MS = 30UL * 60UL * 1000UL;  // 30 minutes
+static uint32_t lastLcdReinitMs = 0;
+
 static inline void relayWrite(bool on)
 {
   if (RELAY_ACTIVE_HIGH) {
@@ -435,6 +439,14 @@ static void updateAndRestart()
 static void updateLcd()
 {
   const uint32_t now = millis();
+  
+  // Periodic LCD re-init to recover from I2C desync
+  if (now - lastLcdReinitMs >= LCD_REINIT_MS) {
+    lastLcdReinitMs = now;
+    lcd.init();
+    lcd.backlight();
+  }
+  
   if (now - lastLcdUpdateMs < LCD_UPDATE_MS)
     return;
 
