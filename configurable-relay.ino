@@ -56,7 +56,7 @@ static constexpr uint32_t LCD_UPDATE_MS = 500;
 static uint32_t lastLcdUpdateMs = 0;
 
 // Re-initialize the LCD periodically to recover from I2C bus glitches
-static constexpr uint32_t LCD_REINIT_MS = 30UL * 60UL * 1000UL;  // 30 minutes
+static constexpr uint32_t LCD_REINIT_MS = 5UL * 60UL * 1000UL;  // 5 minutes
 static uint32_t lastLcdReinitMs = 0;
 
 static inline void relayWrite(bool on)
